@@ -2,36 +2,92 @@
 #include <WiFi.h>
 #include <ArduinoWebsockets.h>
 using namespace websockets;
+WebsocketsClient wsClient;
 
-#define RX2_PIN 16
-#define TX2_PIN 15
-#define IMAGE_MAX_SIZE 100000
+#define RX2_PIN 36
+#define TX2_PIN 35
 #define WIFI_SSID "iPhone"
 #define WIFI_PASS "12345678"
-const char* server_host = "145.24.223.53"; // Your server's IP
+const char* server_host = "145.24.223.53";
 const uint16_t server_port = 8050;
 
-uint8_t imageBuffer[IMAGE_MAX_SIZE];
-volatile size_t imageLength = 0;
-SemaphoreHandle_t imageReadySemaphore;
-SemaphoreHandle_t sendCommandSemaphore;
+// Detection parameters
+const uint8_t DARK_THRESHOLD_R = 6;     // 6*8 = 48 (0-255 scale)
+const uint8_t DARK_THRESHOLD_G = 12;    // 12*4 = 48
+const uint8_t DARK_THRESHOLD_B = 6;     // 6*8 = 48
+const uint16_t MIN_AREA = 500;          // Minimum detection area
+const uint16_t CLOSE_AREA = 1000;       // Area threshold for "close" detection
+const uint16_t BOX_COLOR = 0xF800;      // Red in RGB565 (0xF800)
 
-WebsocketsClient wsClient;
-volatile bool wsConnected = false;
+// Image dimensions
+const int IMG_WIDTH = 160;
+const int IMG_HEIGHT = 120;
+const int IMG_SIZE = IMG_WIDTH * IMG_HEIGHT * 2;  // 38400 bytes
 
-void uploadImageWS(const uint8_t* data, size_t length) {
-    if(wsClient.available()) {
-        wsClient.sendBinary((const char*)data, length);
-        Serial.printf("[UploadWS] Sent %d bytes via WebSocket!\n", length);
-    } else {
-        Serial.println("[UploadWS] WebSocket not connected!");
+bool wsConnected = false;
+unsigned long lastReconnectAttempt = 0;
+int retryCount = 0;
+const int maxRetries = 5;
+const unsigned long retryInterval = 500;
+
+void set_pixel(uint8_t *image, uint16_t x, uint16_t y, uint16_t color, int width, int height) {
+    if (x >= width || y >= height) return;
+    int idx = (y * width + x) * 2;
+    image[idx] = (color >> 8) & 0xFF;
+    image[idx + 1] = color & 0xFF;
+}
+
+void draw_rectangle(uint8_t *image, uint16_t left, uint16_t top, uint16_t right, uint16_t bottom, int width, int height) {
+    for (uint16_t x = left; x <= right; x++) {
+        set_pixel(image, x, top, BOX_COLOR, width, height);
+        set_pixel(image, x, bottom, BOX_COLOR, width, height);
+    }
+    for (uint16_t y = top; y <= bottom; y++) {
+        set_pixel(image, left, y, BOX_COLOR, width, height);
+        set_pixel(image, right, y, BOX_COLOR, width, height);
     }
 }
 
-// --- WebSocket events --- 
+void detect_and_draw_battery(uint8_t *image, int width, int height, int img_len) {
+    uint16_t left = width, right = 0;
+    uint16_t top = height, bottom = 0;
+    bool found = false;
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int idx = (y * width + x) * 2;
+            if (idx + 1 >= img_len) continue; // Prevent buffer overrun
+
+            uint16_t pixel = (image[idx] << 8) | image[idx + 1];
+            uint8_t r = (pixel >> 11) & 0x1F;
+            uint8_t g = (pixel >> 5) & 0x3F;
+            uint8_t b = pixel & 0x1F;
+
+            if (r < DARK_THRESHOLD_R && g < DARK_THRESHOLD_G && b < DARK_THRESHOLD_B) {
+                found = true;
+                if (x < left) left = x;
+                if (x > right) right = x;
+                if (y < top) top = y;
+                if (y > bottom) bottom = y;
+            }
+        }
+    }
+
+    if (found) {
+        uint16_t box_w = right - left + 1;
+        uint16_t box_h = bottom - top + 1;
+        uint32_t area = box_w * box_h;
+
+        if (area > MIN_AREA) {
+            draw_rectangle(image, left, top, right, bottom, width, height);
+            Serial.printf("Battery detected: [%d,%d]-[%d,%d] Area: %d ", left, top, right, bottom, area);
+            Serial.println(area > CLOSE_AREA ? "CLOSE" : "FAR");
+        }
+    }
+}
 void onWebSocketEvent(WebsocketsEvent event, String data) {
     Serial.print("[WS EVENT] ");
-    switch(event) {
+    switch (event) {
         case WebsocketsEvent::ConnectionOpened:
             Serial.println("Connection Opened!");
             wsConnected = true;
@@ -56,78 +112,12 @@ void onWebSocketEvent(WebsocketsEvent event, String data) {
         Serial.print("Event Data: "); Serial.println(data);
     }
 }
-// ---------- Tasks ----------
-void SendCommandTask(void *pvParameters) {
-    while (true) {
-        if (xSemaphoreTake(sendCommandSemaphore, portMAX_DELAY) == pdTRUE) {
-            Serial1.write('C');  // send capture command
-            Serial.println("[Sender] Sent capture command");
-        }
-    }
-}
-void ReceiveImageTask(void *pvParameters) {
-    enum State { WAIT_HEADER_1, WAIT_HEADER_2, READ_SIZE, READ_DATA };
-    State state = WAIT_HEADER_1;
-    uint8_t sizeBuf[2];
-    size_t sizeRead = 0;
-    size_t bytesRead = 0;
-    while (true) {
-        if (Serial1.available()) {
-            uint8_t byte = Serial1.read();
-            switch (state) {
-                case WAIT_HEADER_1:
-                    if (byte == 0xA5) state = WAIT_HEADER_2;
-                    break;
-                case WAIT_HEADER_2:
-                    if (byte == 0x5A) {
-                        state = READ_SIZE;
-                        sizeRead = 0;
-                    } else {
-                        state = WAIT_HEADER_1;
-                    }
-                    break;
-                case READ_SIZE:
-                    sizeBuf[sizeRead++] = byte;
-                    if (sizeRead == 2) {
-                        imageLength = sizeBuf[0] | (sizeBuf[1] << 8);
-                        if (imageLength > IMAGE_MAX_SIZE) {
-                            Serial.println("[Receiver] Image too large");
-                            state = WAIT_HEADER_1;
-                        } else {
-                            bytesRead = 0;
-                            state = READ_DATA;
-                        }
-                    }
-                    break;
-                case READ_DATA:
-                    imageBuffer[bytesRead++] = byte;
-                    if (bytesRead == imageLength) {
-                        Serial.println("[Receiver] Complete image received. Semaphore given!");
-                        xSemaphoreGive(imageReadySemaphore);
-                        state = WAIT_HEADER_1;
-                    }
-                    break;
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    }
-}
-void HandleImageTask(void *pvParameters) {
-    while (true) {
-        Serial.println("[Handler] Waiting for imageReadySemaphore");
-        if (xSemaphoreTake(imageReadySemaphore, portMAX_DELAY) == pdTRUE) {
-            Serial.printf("[Handler] Image received: %d bytes\n", imageLength);
-            uploadImageWS(imageBuffer, imageLength);
-            xSemaphoreGive(sendCommandSemaphore);  // trigger next capture
-        }
-    }
-}
 
-// ---------- Setup ----------
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(230400, SERIAL_8N1, RX2_PIN, TX2_PIN);
+    delay(50);
+    Serial1.begin(4000000, SERIAL_8N1, TX2_PIN, RX2_PIN);
+    delay(100);
 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("Connecting to WiFi");
@@ -137,39 +127,73 @@ void setup() {
     }
     Serial.println("\nConnected to WiFi!");
 
-    // Setup semaphores
-    imageReadySemaphore = xSemaphoreCreateBinary();
-    sendCommandSemaphore = xSemaphoreCreateBinary();
-
-    // Build ws://145.24.223.53:8050/ws
-    String url = String("ws://") + server_host + ":" + String(server_port) + "/ws";
     wsClient.onEvent(onWebSocketEvent);
+    String url = String("ws://") + server_host + ":" + String(server_port) + "/ws";
     wsClient.connect(url);
-
-    // Wait until wsConnected is true (with a timeout/failsafe)
-    Serial.print("Connecting to WebSocket");
-    unsigned long ts = millis();
-    while (!wsConnected && (millis() - ts < 10000)) { // 10s timeout
-        wsClient.poll();
-        delay(10);
-        Serial.print(".");
-    }
-    Serial.println();
-
-    if (!wsConnected) {
-        Serial.println("ERROR: Could not connect to WebSocket server. Restart ESP or check network.");
-        while(1) delay(1000); // don't proceed
-    }
-
-    // Only now, launch your tasks
-    xTaskCreate(SendCommandTask, "SendCommand", 2048, NULL, 1, NULL);
-    xTaskCreate(ReceiveImageTask, "ReceiveImage", 4096, NULL, 2, NULL);
-    xTaskCreate(HandleImageTask, "HandleImage", 4096, NULL, 1, NULL);
-
-    xSemaphoreGive(sendCommandSemaphore);  // start the first capture
+    
     Serial.println("Image receiver started. Waiting for data...");
 }
 
 void loop() {
-    wsClient.poll();  // Keep the WebSocket alive!
+    wsClient.poll();
+    if (!wsConnected && retryCount < maxRetries) {
+        unsigned long now = millis();
+        if (now - lastReconnectAttempt >= retryInterval) {
+            Serial.printf("Reconnect attempt %d/%d\n", retryCount + 1, maxRetries);
+            if (wsClient.connect("ws://145.24.223.53:8050")) {
+                Serial.println("Reconnected!");
+                wsConnected = true;
+                retryCount = 0;
+            } else {
+                Serial.println("Reconnect failed.");
+                retryCount++;
+            }
+            lastReconnectAttempt = now;
+        }
+    }
+
+    Serial.println("Asking for image...");
+    Serial1.write('C');
+
+    // Wait for header
+    while (Serial1.available() < 4);
+
+    if (Serial1.read() == 0xA5 && Serial1.read() == 0x5A) {
+        uint16_t len;
+        Serial1.readBytes((char *)&len, 2);
+
+        Serial.print("Receiving image of ");
+        Serial.print(len);
+        Serial.println(" bytes");
+
+        uint8_t *image = (uint8_t *)malloc(len);
+        if (!image) {
+            Serial.println("Memory allocation failed");
+            return;
+        }
+
+        Serial1.readBytes((char *)image, len);
+
+        // Calculate width/height from length (assuming RGB565)
+        int pixels = len / 2;
+        int width = IMG_WIDTH;
+        int height = pixels / width;
+        if (width * height * 2 != len) {
+            Serial.println("Warning: Image size does not match expected dimensions. Trying best effort.");
+        }
+
+        detect_and_draw_battery(image, width, height, len);
+
+        if (wsConnected) {
+            wsClient.sendBinary((const char *)image, len);
+            Serial.println("Image sent over WebSocket.");
+        } else {
+            Serial.println("WebSocket not connected - image not sent.");
+        }
+
+        free(image);
+    } else {
+        Serial.println("Invalid header received");
+        while (Serial1.available()) Serial1.read();
+    }
 }
